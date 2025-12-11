@@ -25,6 +25,12 @@ PHONE_REGEX = re.compile(
 
 USER_AGENT = "Mozilla/5.0 (compatible; TelCrawler/1.0; +https://example.com)"
 DEFAULT_TIMEOUT = 10
+GREEN = "\033[92m"
+RESET = "\033[0m"
+
+
+def log(message: str) -> None:
+    print(f"[INFO] {message}")
 
 
 def normalize_url(raw_url: str) -> str:
@@ -78,6 +84,7 @@ def crawl_for_phone(start_url: str, max_pages: int, delay: float) -> Optional[st
     try:
         start = normalize_url(start_url)
     except ValueError:
+        log(f"Skipping invalid URL: {start_url}")
         return None
 
     target_domain = urlparse(start).netloc
@@ -91,12 +98,15 @@ def crawl_for_phone(start_url: str, max_pages: int, delay: float) -> Optional[st
             continue
         visited.add(current)
 
+        log(f"Visiting {current}")
         html = fetch(session, current)
         if not html:
+            log(f"  No HTML content, skipping: {current}")
             continue
 
         tel = find_phone_number(html)
         if tel:
+            print(f"{GREEN}[FOUND]{RESET} {target_domain} {tel}")
             return tel
 
         for link in extract_links(html, current):
@@ -131,9 +141,13 @@ def write_results(rows: Iterable[tuple[str, Optional[str]]], output_path: str) -
 def run(input_csv: str, output_csv: str, max_pages: int, delay: float) -> None:
     results = []
     for url in read_urls(input_csv):
+        log(f"Start crawling for {url}")
         tel = crawl_for_phone(url, max_pages=max_pages, delay=delay)
+        if not tel:
+            log(f"No phone number found for {url}")
         results.append((url, tel))
     write_results(results, output_csv)
+    log(f"Wrote results to {output_csv}")
 
 
 def build_parser() -> argparse.ArgumentParser:
