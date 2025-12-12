@@ -33,6 +33,20 @@ pip install -r requirements.txt
 
 3. 結果 CSV (`url`,`tel`) が生成されます。電話番号が見つからなかった場合は空欄になります。
 
+## 本社専用の抽出
+
+`hq_tel_scraper.py` は本社以外の電話番号を極力取り除くための別スクリプトです。`hq_keywords.json` に定義した大量のキーワードを読み込み、「本社」「head office」「global headquarters」など本社を示す語が電話番号の近くに現れた場合のみ採用します。
+
+```bash
+python hq_tel_scraper.py input.csv hq_output.csv \
+  --keywords hq_keywords.json \
+  --max-pages 150
+```
+
+- ① 本社キーワードが半径 80 文字または DOM 上で 3 階層以内にある場合に本社番号としてマークします。
+- ② 内部リンクを巡回した結果、10 桁以上の電話番号が 1 種類しか検出されなければ、その番号を本社として出力します。
+- キーワードは JSON で管理しているため、追加・修正するだけで判定精度を調整できます (`primary_terms` が本社語、`support_terms` が関連語)。
+
 ## 実装メモ
 
 - `requests` + `BeautifulSoup` で HTML を取得・解析しています。

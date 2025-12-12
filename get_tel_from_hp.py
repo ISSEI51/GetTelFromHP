@@ -1,9 +1,11 @@
 import argparse
 import csv
+import os
 import re
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -23,8 +25,24 @@ PHONE_REGEX = re.compile(
     re.VERBOSE,
 )
 
+HEADQUARTERS_KEYWORDS = (
+    "本社",
+    "本社所在地",
+    "本社住所",
+    "本社連絡先",
+    "本社電話",
+    "東京本社",
+    "大阪本社",
+    "head office",
+    "main office",
+    "corporate office",
+    "headquarters",
+    "hq",
+)
+
 USER_AGENT = "Mozilla/5.0 (compatible; TelCrawler/1.0; +https://example.com)"
 DEFAULT_TIMEOUT = 10
+DEFAULT_WORKERS = min(32, (os.cpu_count() or 1) + 4)
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
@@ -51,7 +69,9 @@ def same_domain(url: str, domain: str) -> bool:
 
 def fetch(session: requests.Session, url: str) -> Optional[str]:
     try:
-        response = session.get(url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT)
+        response = session.get(
+            url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT
+        )
         response.raise_for_status()
         if "text/html" not in response.headers.get("Content-Type", ""):
             return None
@@ -72,11 +92,50 @@ def extract_links(html: str, base_url: str) -> Iterable[str]:
 
 def find_phone_number(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
+
+    def extract_candidates(text: str) -> Iterable[str]:
+        for match in PHONE_REGEX.finditer(text):
+            tel = match.group().strip()
+            digits = re.sub(r"\D", "", tel)
+            if len(digits) < 10:
+                continue
+            if not (digits.startswith("0") or digits.startswith("81")):
+                continue
+            yield tel
+
+    def contains_hq_keyword(text: str) -> bool:
+        lowered = text.lower()
+        return any(keyword in lowered for keyword in HEADQUARTERS_KEYWORDS)
+
+    # Prefer phone numbers that appear near "headquarters" keywords.
+    for node in soup.find_all(
+        string=lambda value: bool(value and contains_hq_keyword(value))
+    ):
+        parent = node.parent
+        depth = 0
+        while parent and depth < 3:
+            segment = parent.get_text(" ", strip=True)
+            for tel in extract_candidates(segment):
+                return tel
+            parent = parent.parent
+            depth += 1
+
     text = soup.get_text(" ", strip=True)
-    for match in PHONE_REGEX.findall(text):
-        digits = re.sub(r"\D", "", match)
-        if len(digits) >= 9:
-            return match
+    for match in PHONE_REGEX.finditer(text):
+        tel = match.group().strip()
+        digits = re.sub(r"\D", "", tel)
+        if len(digits) < 10:
+            continue
+        if not (digits.startswith("0") or digits.startswith("81")):
+            continue
+        start, end = match.span()
+        context = text[max(0, start - 40) : min(len(text), end + 40)]
+        if contains_hq_keyword(context):
+            return tel
+
+    for tel in extract_candidates(text):
+        return tel
+
     return None
 
 
@@ -106,7 +165,7 @@ def crawl_for_phone(start_url: str, max_pages: int, delay: float) -> Optional[st
 
         tel = find_phone_number(html)
         if tel:
-            print(f"{GREEN}[FOUND]{RESET} {target_domain} {tel}")
+            print(f"{GREEN}[FOUND]{target_domain} {tel}{RESET}")
             return tel
 
         for link in extract_links(html, current):
@@ -138,20 +197,39 @@ def write_results(rows: Iterable[tuple[str, Optional[str]]], output_path: str) -
             writer.writerow({"url": url, "tel": tel or ""})
 
 
-def run(input_csv: str, output_csv: str, max_pages: int, delay: float) -> None:
-    results = []
-    for url in read_urls(input_csv):
+def run(
+    input_csv: str, output_csv: str, max_pages: int, delay: float, workers: int
+) -> None:
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+    urls = list(read_urls(input_csv))
+    if not urls:
+        write_results([], output_csv)
+        log("No URLs provided")
+        return
+
+    results: list[tuple[str, Optional[str]]] = []
+
+    def process(url: str) -> tuple[str, Optional[str]]:
         log(f"Start crawling for {url}")
         tel = crawl_for_phone(url, max_pages=max_pages, delay=delay)
         if not tel:
             log(f"No phone number found for {url}")
-        results.append((url, tel))
+        return url, tel
+
+    worker_count = min(workers, len(urls))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for url, tel in executor.map(process, urls):
+            results.append((url, tel))
+
     write_results(results, output_csv)
     log(f"Wrote results to {output_csv}")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Extract phone numbers from company homepages")
+    parser = argparse.ArgumentParser(
+        description="Extract phone numbers from company homepages"
+    )
     parser.add_argument("input", help="Input CSV file with a 'url' column")
     parser.add_argument("output", help="Output CSV path")
     parser.add_argument(
@@ -166,6 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Delay in seconds between requests (default: 0)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="Number of concurrent workers (default: auto)",
+    )
     return parser
 
 
@@ -173,7 +257,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        run(args.input, args.output, args.max_pages, args.delay)
+        run(args.input, args.output, args.max_pages, args.delay, args.workers)
     except Exception as exc:  # pragma: no cover
         parser.error(str(exc))
     return 0
